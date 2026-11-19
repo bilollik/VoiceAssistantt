@@ -1,0 +1,291 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/example/assistant
+          cat > settings.gradle.kts <<'ENDOFFILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "VoiceAssistant"
+          include(":app")
+          ENDOFFILE
+          cat > build.gradle.kts <<'ENDOFFILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          ENDOFFILE
+          cat > gradle.properties <<'ENDOFFILE'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          ENDOFFILE
+          cat > app/build.gradle.kts <<'ENDOFFILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.assistant"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.assistant"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          ENDOFFILE
+          cat > app/src/main/AndroidManifest.xml <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
+              </queries>
+              <application
+                  android:label="Помощник"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          ENDOFFILE
+          cat > app/src/main/java/com/example/assistant/MainActivity.kt <<'ENDOFFILE'
+          package com.example.assistant
+
+          import android.app.Activity
+          import android.content.ActivityNotFoundException
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.AlarmClock
+          import android.speech.RecognizerIntent
+          import android.speech.tts.TextToSpeech
+          import android.text.InputType
+          import android.view.KeyEvent
+          import android.view.inputmethod.EditorInfo
+          import android.widget.*
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          class MainActivity : Activity(), TextToSpeech.OnInitListener {
+              private lateinit var tts: TextToSpeech
+              private lateinit var out: TextView
+              private lateinit var notesView: TextView
+              private val prefs by lazy { getSharedPreferences("assistant", MODE_PRIVATE) }
+
+              // Русские названия -> как приложение может называться на телефоне
+              private val aliases = mapOf(
+                  "ютуб" to "youtube", "телеграм" to "telegram", "ватсап" to "whatsapp", "вацап" to "whatsapp",
+                  "спотифай" to "spotify", "камера" to "camera", "настройки" to "settings", "калькулятор" to "calculator",
+                  "карты" to "maps", "почта" to "gmail", "браузер" to "chrome", "часы" to "clock",
+                  "галерея" to "gallery", "инстаграм" to "instagram", "тикток" to "tiktok", "вк" to "vk"
+              )
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  tts = TextToSpeech(this, this)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  val mic = Button(this).apply {
+                      text = "🎙  Говорить"; textSize = 22f
+                      setOnClickListener { listen() }
+                  }
+                  val input = EditText(this).apply {
+                      hint = "Или напиши команду"; maxLines = 1
+                      inputType = InputType.TYPE_CLASS_TEXT
+                      imeOptions = EditorInfo.IME_ACTION_SEND
+                      setOnEditorActionListener { v, _, _ -> handle(v.text.toString()); v.text = ""; true }
+                  }
+                  out = TextView(this).apply {
+                      textSize = 16f; setPadding(0, pad, 0, pad)
+                      text = "Скажи: «открой ютуб», «следующая песня», «таймер на 5 минут», «заметка купить молоко» или «найди рецепт блинов»."
+                  }
+                  val head = TextView(this).apply { text = "Заметки"; textSize = 18f; setTypeface(null, Typeface.BOLD) }
+                  notesView = TextView(this).apply { textSize = 16f }
+                  root.addView(mic); root.addView(input); root.addView(out); root.addView(head)
+                  root.addView(ScrollView(this).apply { addView(notesView) })
+                  setContentView(root)
+                  showNotes()
+              }
+
+              override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) tts.language = Locale("ru")
+              }
+
+              override fun onDestroy() { tts.shutdown(); super.onDestroy() }
+
+              private fun reply(t: String) {
+                  out.text = t
+                  tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "r")
+              }
+
+              private fun listen() {
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                      .putExtra(RecognizerIntent.EXTRA_PROMPT, "Говорите")
+                  try { startActivityForResult(i, 1) }
+                  catch (e: ActivityNotFoundException) { reply("На телефоне нет службы распознавания речи. Пиши команды текстом.") }
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 1 && res == RESULT_OK) {
+                      data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { handle(it) }
+                  }
+              }
+
+              private fun handle(raw: String) {
+                  val t = raw.lowercase(Locale("ru")).replace('ё', 'е').trim()
+                  if (t.isEmpty()) return
+
+                  if ("заметк" in t || t.startsWith("запиши")) return handleNotes(raw, t)
+
+                  if ("таймер" in t) {
+                      val sec = seconds(t) ?: return reply("На сколько? Например: таймер на 5 минут")
+                      try {
+                          startActivity(
+                              Intent(AlarmClock.ACTION_SET_TIMER)
+                                  .putExtra(AlarmClock.EXTRA_LENGTH, sec)
+                                  .putExtra(AlarmClock.EXTRA_MESSAGE, "Помощник")
+                                  .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                          )
+                          reply("Таймер поставлен")
+                      } catch (e: Exception) { reply("Не получилось поставить таймер") }
+                      return
+                  }
+
+                  Regex("^(?:открой|запусти|включи)\\s+(.+)").find(t)?.let { m ->
+                      val name = m.groupValues[1]
+                      if (!name.startsWith("музык")) {
+                          return reply(if (openApp(name)) "Открываю $name" else "Не нашёл приложение «$name»")
+                      }
+                  }
+
+                  when {
+                      Regex("следующ|дальше|скип|пропусти|переключи").containsMatchIn(t) -> { media(KeyEvent.KEYCODE_MEDIA_NEXT); reply("Следующий трек") }
+                      Regex("предыдущ|назад|прошл").containsMatchIn(t) -> { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); reply("Предыдущий трек") }
+                      Regex("пауза|стоп|останови|выключи музыку").containsMatchIn(t) -> { media(KeyEvent.KEYCODE_MEDIA_PAUSE); reply("Пауза") }
+                      Regex("играй|продолжи|воспроизведи|включи музыку|плей").containsMatchIn(t) -> { media(KeyEvent.KEYCODE_MEDIA_PLAY); reply("Играю") }
+                      "громче" in t -> volume(AudioManager.ADJUST_RAISE)
+                      "тише" in t -> volume(AudioManager.ADJUST_LOWER)
+                      Regex("который час|сколько времени").containsMatchIn(t) ->
+                          reply("Сейчас " + SimpleDateFormat("HH:mm", Locale("ru")).format(Date()))
+                      else -> {
+                          val q = Regex("^(?:найди|поищи|загугли|погугли|что такое|кто такой|кто такая)\\s*").replace(t, "").ifBlank { t }
+                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))))
+                          reply("Ищу: $q")
+                      }
+                  }
+              }
+
+              // Управляет тем плеером, который сейчас играет (Spotify, YouTube Music и т. д.)
+              private fun media(code: Int) {
+                  val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+              }
+
+              private fun volume(dir: Int) {
+                  (getSystemService(AUDIO_SERVICE) as AudioManager)
+                      .adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, AudioManager.FLAG_SHOW_UI)
+              }
+
+              private fun openApp(name: String): Boolean {
+                  val pm = packageManager
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val keys = listOfNotNull(name.trim(), aliases[name.trim()])
+                  fun label(i: android.content.pm.ResolveInfo) = i.loadLabel(pm).toString().lowercase()
+                  val hit = apps.firstOrNull { a -> keys.any { label(a) == it } }
+                      ?: apps.firstOrNull { a -> keys.any { label(a).contains(it) } }
+                      ?: return false
+                  val launch = pm.getLaunchIntentForPackage(hit.activityInfo.packageName) ?: return false
+                  startActivity(launch)
+                  return true
+              }
+
+              private fun seconds(t: String): Int? {
+                  if ("полчаса" in t) return 1800
+                  val m = Regex("(\\d+)?\\s*(секунд\\w*|сек|минут\\w*|мин|час\\w*)").find(t) ?: return null
+                  val unit = m.groupValues[2]
+                  val n = m.groupValues[1].toIntOrNull() ?: if (unit.startsWith("сек")) return null else 1
+                  return n * when { unit.startsWith("сек") -> 1; unit.startsWith("ч") -> 3600; else -> 60 }
+              }
+
+              // ---------- Заметки ----------
+              private fun notes(): MutableList<String> =
+                  (prefs.getString("n", "") ?: "").split("\n").filter { it.isNotBlank() }.toMutableList()
+
+              private fun save(l: List<String>) {
+                  prefs.edit().putString("n", l.joinToString("\n")).apply()
+                  showNotes()
+              }
+
+              private fun showNotes() {
+                  val l = notes()
+                  notesView.text = if (l.isEmpty()) "Пока пусто" else l.mapIndexed { i, s -> "${i + 1}. $s" }.joinToString("\n")
+              }
+
+              private fun handleNotes(raw: String, t: String) {
+                  val l = notes()
+                  when {
+                      Regex("удали|очисти").containsMatchIn(t) -> {
+                          if ("последн" in t && l.isNotEmpty()) l.removeAt(l.size - 1) else l.clear()
+                          save(l); reply("Готово")
+                      }
+                      Regex("прочитай|покажи|мои заметки|список").containsMatchIn(t) ->
+                          reply(if (l.isEmpty()) "Заметок нет" else l.joinToString(". "))
+                      else -> {
+                          val body = Regex("^\\s*(?:запиши|добавь|создай|сделай)?\\s*(?:(?:в\\s+)?заметк\\w*)?[:,]?\\s*", RegexOption.IGNORE_CASE)
+                              .replace(raw, "").trim()
+                          if (body.isEmpty()) reply("Что записать?")
+                          else { l.add(body.replace("\n", " ")); save(l); reply("Записал: $body") }
+                      }
+                  }
+              }
+          }
+          ENDOFFILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceAssistant-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
